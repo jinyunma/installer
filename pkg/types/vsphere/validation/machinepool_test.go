@@ -84,7 +84,7 @@ func TestValidateMachinePool(t *testing.T) {
 					},
 				},
 			},
-			expectedErrMsg: `^test-path\.coresPerSocket: Invalid value: 8: cores per socket must be less than the number of CPUs \(which is by default \d+\)$`,
+			expectedErrMsg: `^test-path\.coresPerSocket: Invalid value: 8: cores per socket must be less than number of CPUs$`,
 		},
 		{
 			name:     "numCPUs not a multiple of cores per socket",
@@ -97,7 +97,7 @@ func TestValidateMachinePool(t *testing.T) {
 					},
 				},
 			},
-			expectedErrMsg: `^test-path.cpus: Invalid value: 7: numCPUs specified should be a multiple of cores per socket \(which is by default \d+\)$`,
+			expectedErrMsg: `^test-path.cpus: Invalid value: 7: numCPUs specified should be a multiple of cores per socket$`,
 		},
 		{
 			name:     "numCPUs not a multiple of default cores per socket",
@@ -109,7 +109,7 @@ func TestValidateMachinePool(t *testing.T) {
 					},
 				},
 			},
-			expectedErrMsg: `^test-path.cpus: Invalid value: 7: numCPUs specified should be a multiple of cores per socket \(which is by default \d+\)$`,
+			expectedErrMsg: `^test-path.cpus: Invalid value: 7: numCPUs specified should be a multiple of cores per socket which is by default 4$`,
 		},
 		{
 			name: "multi-zone invalid zone name",
