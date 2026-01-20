@@ -12,8 +12,10 @@ import (
 	azurestackdns "github.com/Azure/azure-sdk-for-go/profiles/2018-03-01/dns/mgmt/dns"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	azcoreto "github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v3"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resourcegraph/armresourcegraph"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/Azure/azure-sdk-for-go/services/preview/dns/mgmt/2018-03-01-preview/dns"
@@ -243,7 +245,7 @@ func (o *ClusterUninstaller) Run() (*types.ClusterQuota, error) {
 		false,
 		func(ctx context.Context) (bool, error) {
 			o.Logger.Debugf("deleting application registrations")
-			err = deleteApplicationRegistrations(ctx, o.msgraphClient, o.Logger, o.InfraID)
+			err = deleteApplicationRegistrations(ctx, o.msgraphClient, o.Logger, o.InfraID, o.Session.Credentials.SubscriptionID, o.Session.TokenCreds, o.Session.CloudConfig)
 			if err != nil {
 				oDataErr := extractODataError(err)
 				o.Logger.Debug(oDataErr)
@@ -720,7 +722,53 @@ func extractODataError(err error) error {
 	return err
 }
 
-func deleteApplicationRegistrations(ctx context.Context, graphClient *msgraphsdk.GraphServiceClient, logger logrus.FieldLogger, infraID string) error {
+// deleteRoleAssignmentsForServicePrincipal deletes all role assignments associated with a service principal.
+// This prevents orphaned role assignments from being left behind when the service principal is deleted.
+func deleteRoleAssignmentsForServicePrincipal(ctx context.Context, subscriptionID, principalID string, tokenCredential azcore.TokenCredential, clientOpts *arm.ClientOptions, logger logrus.FieldLogger) error {
+	clientFactory, err := armauthorization.NewClientFactory(subscriptionID, tokenCredential, clientOpts)
+	if err != nil {
+		return fmt.Errorf("failed to create authorization client factory: %w", err)
+	}
+
+	roleAssignmentsClient := clientFactory.NewRoleAssignmentsClient()
+
+	// List all role assignments for this service principal
+	filter := fmt.Sprintf("principalId eq '%s'", principalID)
+	pager := roleAssignmentsClient.NewListForSubscriptionPager(&armauthorization.RoleAssignmentsClientListForSubscriptionOptions{
+		Filter: &filter,
+	})
+
+	var errorList []error
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list role assignments for principal %s: %w", principalID, err)
+		}
+
+		for _, assignment := range page.Value {
+			if assignment.ID == nil || assignment.Name == nil || assignment.Properties == nil || assignment.Properties.Scope == nil {
+				logger.Warn("Encountered role assignment with nil ID, Name, or Scope, skipping")
+				continue
+			}
+
+			scope := *assignment.Properties.Scope
+			name := *assignment.Name
+			logger.Debugf("Deleting role assignment %s at scope %s", name, scope)
+			_, err := roleAssignmentsClient.Delete(ctx, scope, name, nil)
+			if err != nil {
+				logger.WithError(err).Warnf("Failed to delete role assignment %s", name)
+				errorList = append(errorList, fmt.Errorf("failed to delete role assignment %s: %w", name, err))
+				// Continue with other deletions even if one fails
+			} else {
+				logger.Infof("Deleted role assignment %s", name)
+			}
+		}
+	}
+
+	return utilerrors.NewAggregate(errorList)
+}
+
+func deleteApplicationRegistrations(ctx context.Context, graphClient *msgraphsdk.GraphServiceClient, logger logrus.FieldLogger, infraID string, subscriptionID string, tokenCredential azcore.TokenCredential, cloudConfig cloud.Configuration) error {
 	tag := fmt.Sprintf("kubernetes.io_cluster.%s=owned", infraID)
 	servicePrincipals, err := getServicePrincipalsByTag(ctx, graphClient, tag, infraID)
 	if err != nil {
@@ -732,10 +780,26 @@ func deleteApplicationRegistrations(ctx context.Context, graphClient *msgraphsdk
 		return nil
 	}
 
+	clientOpts := &arm.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+
 	var errorList []error
 	for _, sp := range servicePrincipals {
 		appID := *sp.GetAppId()
-		logger := logger.WithField("appID", appID)
+		spObjectID := *sp.GetId()
+		logger := logger.WithField("appID", appID).WithField("spObjectID", spObjectID)
+
+		// Delete role assignments before deleting the service principal/application
+		// This prevents orphaned role assignments from being left behind
+		logger.Debug("Deleting role assignments for service principal")
+		err := deleteRoleAssignmentsForServicePrincipal(ctx, subscriptionID, spObjectID, tokenCredential, clientOpts, logger)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to delete role assignments for service principal, continuing with application deletion")
+			// Don't add to errorList - we want to continue with app deletion even if role assignment deletion fails
+		}
 
 		filter := fmt.Sprintf("appId eq '%s'", appID)
 		listQuery := applications.ApplicationsRequestBuilderGetRequestConfiguration{
